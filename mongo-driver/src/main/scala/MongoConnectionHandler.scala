@@ -26,6 +26,9 @@ import com.mongodb.async.futures._
 import org.jboss.netty.buffer._
 import java.net.InetSocketAddress
 import java.nio.ByteOrder
+import java.util.concurrent.Executors
+import com.mongodb.async.util.ThreadFactories
+
 /**
  * Base trait for all connections, be it direct, replica set, etc
  *
@@ -39,6 +42,12 @@ import java.nio.ByteOrder
 abstract class MongoConnectionHandler extends SimpleChannelHandler with Logging {
   protected val bootstrap: ClientBootstrap
   protected[mongodb] var maxBSONObjectSize = 1024 * 4 * 4 // default
+
+  // These threads decode incoming messages and then invoke application
+  // callbacks; this way we avoid doing CPU work on the Netty IO thread
+  // when we could be reading more data. This also keeps apps from
+  // screwing themselves by blocking up IO threads.
+  protected val decoderThreadPool = Executors.newCachedThreadPool(ThreadFactories("Hammersmith Decoder"))
 
   protected def queryFail(reply: ReplyMessage, result: RequestFuture) = {
     log.trace("Query Failure")
@@ -57,9 +66,7 @@ abstract class MongoConnectionHandler extends SimpleChannelHandler with Logging 
     }
   }
 
-  override def messageReceived(ctx: ChannelHandlerContext, e: MessageEvent) {
-    val buf = e.getMessage.asInstanceOf[ChannelBuffer]
-    log.debug("Incoming Message received on (%s) Length: %s", buf, buf.readableBytes())
+  private def processBuffer(ctx : ChannelHandlerContext, buf : ChannelBuffer) = {
     MongoMessage.unapply(new ChannelBufferInputStream(buf)) match {
       case reply: ReplyMessage => {
         log.debug("Reply Message Received: %s", reply)
@@ -161,6 +168,19 @@ abstract class MongoConnectionHandler extends SimpleChannelHandler with Logging 
         log.warn("Unknown message type '%s'; ignoring.", default)
       }
     }
+  }
+
+  override def messageReceived(ctx: ChannelHandlerContext, e: MessageEvent) {
+    val buf = e.getMessage.asInstanceOf[ChannelBuffer]
+    log.debug("Incoming Message received on (%s) Length: %s", buf, buf.readableBytes())
+    decoderThreadPool.submit(new Runnable() {
+      override def run() = {
+        // FIXME I think the ctx may only be used to pull maxBSONSize off the handler,
+        // it'd feel a lot safer to just pass the size. But netty docs say that
+        // ctx is OK to use from another thread.
+        processBuffer(ctx, buf)
+      }
+    })
   }
 
   override def exceptionCaught(ctx: ChannelHandlerContext, e: ExceptionEvent) {
